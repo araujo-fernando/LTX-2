@@ -26,14 +26,50 @@ def is_mps_available() -> bool:
     return bool(mps_backend is not None and mps_backend.is_available())
 
 
+_MIN_DISCRETE_VRAM_BYTES = 4 * (1024**3)
+
+
+def get_discrete_cuda_devices() -> list[torch.device]:
+    """Return discrete CUDA/ROCm devices (>= 4 GiB VRAM), ordered with RX 9070 XT / highest CU count first."""
+    if not torch.cuda.is_available():
+        return []
+    candidates: list[tuple[int, int, int, int]] = []
+    for idx in range(torch.cuda.device_count()):
+        try:
+            props = torch.cuda.get_device_properties(idx)
+        except Exception:
+            continue
+        if props.total_memory < _MIN_DISCRETE_VRAM_BYTES:
+            continue
+        is_xt = 1 if "XT" in getattr(props, "name", "").upper() else 0
+        cu_count = getattr(props, "multi_processor_count", 0)
+        candidates.append((is_xt, cu_count, int(props.total_memory), idx))
+    candidates.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
+    return [torch.device("cuda", item[3]) for item in candidates]
+
+
+def get_split_gpu_devices() -> tuple[torch.device, torch.device] | None:
+    """Return (primary_gpu, secondary_gpu) when at least 2 discrete GPUs are available.
+    Primary is always the stronger GPU (e.g. RX 9070 XT) so heavy components like VAE stay on it.
+    """
+    devices = get_discrete_cuda_devices()
+    if len(devices) >= 2:
+        return devices[0], devices[1]
+    return None
+
+
 def get_preferred_device(local_rank: int | None = None) -> torch.device:
     """Prefer CUDA, then MPS, then CPU.
     ``local_rank`` is only meaningful for CUDA multi-process launches. MPS exposes
     a single logical device in PyTorch, so rank-based indexing is not used there.
     """
     if torch.cuda.is_available():
-        index = torch.cuda.current_device() if local_rank is None else local_rank
-        return torch.device("cuda", index)
+        if local_rank is not None:
+            return torch.device("cuda", local_rank)
+        discrete = get_discrete_cuda_devices()
+        if discrete:
+            return discrete[0]
+        return torch.device("cuda", torch.cuda.current_device())
     if is_mps_available():
         return torch.device("mps")
     return torch.device("cpu")
@@ -84,6 +120,10 @@ def upload_from_host(host: torch.Tensor, device: torch.device) -> torch.Tensor:
 
 def synchronize_device(device: DeviceSpec = None) -> None:
     """Synchronize CUDA or MPS work if the selected backend supports it."""
+    if device is None and torch.cuda.is_available():
+        for dev in get_discrete_cuda_devices() or [torch.device("cuda", torch.cuda.current_device())]:
+            torch.cuda.synchronize(dev)
+        return
     resolved = resolve_device(device)
     if resolved.type == "cuda" and torch.cuda.is_available():
         torch.cuda.synchronize(resolved)

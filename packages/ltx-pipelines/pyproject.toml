@@ -7,6 +7,9 @@ license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = ["ltx-core", "av", "tqdm", "pillow", "openimageio", "cloudpickle>=3.1"]
 
+[project.scripts]
+ltx-run = "ltx_pipelines.cli_rocm:main"
+
 [project.optional-dependencies]
 # Videoseal 1.0.1 on PyPI predates PixelSeal; pin a commit that includes pixelseal.yaml.
 videoseal = [
@@ -17,5 +20,5 @@ audioseal = [
 ]
 
 [build-system]
-requires = ["uv_build>=0.9.8,<0.10.0"]
+requires = ["uv_build>=0.9.8"]
 build-backend = "uv_build"

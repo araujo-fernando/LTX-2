@@ -9,6 +9,7 @@ from transformers import AutoModelForImageTextToText, PretrainedConfig
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioAttention, Gemma4AudioRelPositionalEncoding
 
+from ltx_core.devices import get_split_gpu_devices
 from ltx_core.loader import parse_model_version
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.sd_ops import SDOps
@@ -396,6 +397,64 @@ def _populate_rotary_v5(l_model: torch.nn.Module, config: object) -> None:
         setattr(rope_emb, f"{layer_type}_attention_scaling", attn_scaling)
 
 
+def _move_tree_to_device(obj: object, device: torch.device) -> object:
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device) if obj.device != device else obj
+    if isinstance(obj, tuple):
+        return tuple(_move_tree_to_device(x, device) for x in obj)
+    if isinstance(obj, list):
+        return [_move_tree_to_device(x, device) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _move_tree_to_device(v, device) for k, v in obj.items()}
+    return obj
+
+
+def _configure_gemma_split_gpu(module: LTXGemmaTextEncoder) -> None:
+    split_devices = get_split_gpu_devices()
+    if split_devices is None:
+        return
+    primary, secondary = split_devices
+    l_model = module.model.model.language_model
+    layers = l_model.layers
+    num_layers = len(layers)
+    if num_layers < 2:
+        return
+    split_idx = num_layers // 2
+    module._is_split_gpu = True  # type: ignore[attr-defined]
+
+    def _key_device(key: str) -> torch.device:
+        marker = "language_model.layers."
+        pos = key.find(marker)
+        if pos != -1:
+            rest = key[pos + len(marker) :]
+            layer_str = rest.split(".", 1)[0]
+            if layer_str.isdigit() and int(layer_str) >= split_idx:
+                return secondary
+        return primary
+
+    module._key_device_map = _key_device  # type: ignore[attr-defined]
+    for idx, layer in enumerate(layers):
+        target_dev = primary if idx < split_idx else secondary
+        layer._block_device = target_dev  # type: ignore[attr-defined]
+        if idx >= split_idx:
+            layer.register_forward_pre_hook(
+                lambda _m, args, kwargs, d=target_dev: (_move_tree_to_device(args, d), _move_tree_to_device(kwargs, d)),
+                with_kwargs=True,
+            )
+    l_model.rotary_emb._block_device = primary  # type: ignore[attr-defined]
+    l_model.embed_tokens._block_device = primary  # type: ignore[attr-defined]
+    l_model.norm._block_device = primary  # type: ignore[attr-defined]
+    l_model.norm.register_forward_pre_hook(lambda _m, args, d=primary: _move_tree_to_device(args, d))
+    logger.info(
+        "Gemma 50:50 GPU split enabled: layers 0..%d -> %s, layers %d..%d -> %s",
+        split_idx - 1,
+        primary,
+        split_idx,
+        num_layers - 1,
+        secondary,
+    )
+
+
 def _populate_language_model_buffers(module: LTXGemmaTextEncoder) -> LTXGemmaTextEncoder:
     """Populate the non-persistent rotary and embed-scale buffers shared by all Gemma families."""
     model = module.model
@@ -412,6 +471,7 @@ def _populate_language_model_buffers(module: LTXGemmaTextEncoder) -> LTXGemmaTex
         per_layer_scale = torch.tensor(config.hidden_size_per_layer_input**0.5, device="cpu")
         l_model.embed_tokens_per_layer.register_buffer("embed_scale", per_layer_scale, persistent=False)
 
+    _configure_gemma_split_gpu(module)
     return module
 
 

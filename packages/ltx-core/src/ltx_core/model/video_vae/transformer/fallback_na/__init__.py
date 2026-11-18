@@ -79,7 +79,15 @@ def na_attention_triton(
     v: torch.Tensor,
     kernel_size: list[int],
 ) -> torch.Tensor:
-    """Opaque Triton NA launch so the surrounding block graph stays whole under compile."""
+    """Opaque Triton / HIP NA launch so the surrounding block graph stays whole under compile."""
+    try:
+        import comfy_kitchen as ck  # noqa: PLC0415
+
+        if torch.version.cuda is None:
+            ck.registry.disable("cuda")
+        return ck.na3d(q, k, v, kernel_size=kernel_size, is_causal=None, scale=1.0)
+    except Exception:
+        pass
     from ltx_core.model.video_vae.transformer.fallback_na.triton_na import (  # noqa: PLC0415
         na3d as triton_na3d,
     )

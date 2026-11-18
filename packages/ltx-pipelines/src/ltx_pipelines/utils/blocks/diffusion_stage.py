@@ -14,13 +14,14 @@ from ltx_core.batch_split import BatchSplitAdapter
 from ltx_core.components.noisers import Noiser
 from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
 from ltx_core.conditioning import ConditioningItem, VideoGeneratedKeyframeSlots
-from ltx_core.devices import synchronize_device
+from ltx_core.devices import get_split_gpu_devices, synchronize_device
 from ltx_core.loader import SDOps
 from ltx_core.loader.attention_ops import set_attention_module_op
 from ltx_core.loader.distributed_builders import SequenceParallelBuilder, TiledDataParallelBuilder
 from ltx_core.loader.helpers import to_device
 from ltx_core.loader.lora_request import LoraPathStrengthAndSDOps
 from ltx_core.loader.model_builder import ModelBuilder
+from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.registry import ModelRegistry
 from ltx_core.loader.simple_builder import LoRARequest, SimpleBuilder
 from ltx_core.loader.streaming_builder import StreamingBuilder, StreamingConfig
@@ -37,6 +38,10 @@ from ltx_core.model.transformer.compiling import (
 )
 from ltx_core.model.transformer.model_configurator import transformer_checkpoint_selection_ops
 from ltx_core.quantization import QuantizationPolicy
+from ltx_core.quantization.int8_convrot import (
+    build_policy as build_int8_convrot_policy,
+    has_int8_convrot_layers,
+)
 from ltx_core.quantization.policy import compose_quantization
 from ltx_core.tools import AudioLatentTools, LatentTools, VideoLatentTools
 from ltx_core.types import (
@@ -71,6 +76,49 @@ __all__ = ["DenoisingLoop", "DiffusionStage", "ModelWrapper", "RecordingDiffusio
 
 def _unit_lora_request(lora: LoraPathStrengthAndSDOps) -> LoRARequest:
     return LoRARequest((Path(lora.path),), lora.strength, (lora.sd_ops,))
+
+
+def _configure_transformer_split_gpu(model: torch.nn.Module) -> torch.nn.Module:
+    split_devices = get_split_gpu_devices()
+    if split_devices is None or not hasattr(model, "transformer_blocks"):
+        return model
+    primary, secondary = split_devices
+    blocks = model.transformer_blocks
+    num_blocks = len(blocks)
+    if num_blocks < 2:
+        return model
+    split_idx = num_blocks // 2
+    model._is_split_gpu = True  # type: ignore[attr-defined]
+
+    def _key_device(key: str) -> torch.device:
+        marker = "transformer_blocks."
+        pos = key.find(marker)
+        if pos != -1:
+            rest = key[pos + len(marker) :]
+            block_str = rest.split(".", 1)[0]
+            if block_str.isdigit() and int(block_str) >= split_idx:
+                return secondary
+        return primary
+
+    model._key_device_map = _key_device  # type: ignore[attr-defined]
+    for idx, block in enumerate(blocks):
+        block._block_device = primary if idx < split_idx else secondary  # type: ignore[attr-defined]
+    logger.info(
+        "LTX Transformer 50:50 GPU split enabled: stem/head + blocks 0..%d -> %s, blocks %d..%d -> %s",
+        split_idx - 1,
+        primary,
+        split_idx,
+        num_blocks - 1,
+        secondary,
+    )
+    return model
+
+
+_SPLIT_GPU_MODULE_OP = ModuleOps(
+    "ltx-split-gpu-50-50",
+    matcher=lambda model: hasattr(model, "transformer_blocks"),
+    mutator=_configure_transformer_split_gpu,
+)
 
 
 class DiffusionStage:
@@ -149,12 +197,17 @@ class DiffusionStage:
         mapping.
         """
         unit_registry = registry or ModelRegistry()
+        if quantization is None and has_int8_convrot_layers((checkpoint_path,), sd_ops=(model_sd_ops,)):
+            logger.info("Auto-detected INT8 ConvRot checkpoint at %s", checkpoint_path)
+            quantization = build_int8_convrot_policy(checkpoint_path)
         transformer_builder: ModelBuilder
         if offload_mode == OffloadMode.NONE:
+            split_ops = (_SPLIT_GPU_MODULE_OP,) if get_split_gpu_devices() is not None else ()
             transformer_builder = SimpleBuilder(
                 model_configurator,
                 (Path(checkpoint_path),),
                 (model_sd_ops,),
+                module_ops=split_ops,
                 loras=tuple(_unit_lora_request(lora) for lora in loras),
                 registry=unit_registry,
             )

@@ -52,7 +52,7 @@ _ASSET_GLOB_EXCLUDES = frozenset({"config.json", "tokenizer.json"})
 
 def is_safetensors_file(path: str | Path) -> bool:
     p = Path(path)
-    return p.is_file() and p.suffix == ".safetensors"
+    return p.is_file()
 
 
 @dataclass(frozen=True, slots=True)

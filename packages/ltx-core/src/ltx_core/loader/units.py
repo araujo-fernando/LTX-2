@@ -397,7 +397,7 @@ class PatchedUnitSpec:
                         or torch.Size((b_shape[0], a_shape[1])) != logical_shape
                     ):
                         raise ValueError(f"LoRA factors for {key!r} do not match the model weight")
-                    if weight_dtype in (torch.uint8, torch.float8_e4m3fn, torch.float8_e5m2):
+                    if weight_dtype in (torch.int8, torch.uint8, torch.float8_e4m3fn, torch.float8_e5m2):
                         prefix = key.removesuffix(".weight")
                         missing = [
                             f"{prefix}{suffix}"

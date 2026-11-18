@@ -204,7 +204,7 @@ class SDOps:
 
         if self.allowed_keys is not None and key not in self.allowed_keys:
             return None
-        if key.startswith(self.excluded_prefixes):
+        if key.startswith(self.excluded_prefixes) or key.endswith(".comfy_quant"):
             return None
 
         return key

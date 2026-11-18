@@ -146,9 +146,14 @@ class StateLoader:
             )
             if active_placement.device is not None and hit.placement != active_placement:
                 self.registry.retain_state(patched, active, active_placement)
-        elif not patched.loras and clean_placement.device is None and patched.requested_dtype is None:
-            validate_destination(spec, dst, None)
+        elif clean_placement.device is None and (
+            not patched.loras
+            or (active_placement.device is None and bool(dst) and all(name in dst for name in spec.unit.metadata))
+        ):
+            validate_destination(spec, dst, patched.requested_dtype)
             fill_from_source(file_read_parts(patched), source, destination=dst, device=device, cache=cache)
+            if patched.loras:
+                self.fuser.patch_into(patched, dst, factors, dst)
             self._retain_active(patched, dst, active_placement)
             return dst
         else:
@@ -241,6 +246,11 @@ class StateLoader:
                 )
                 if placement.device is not None:
                     values = self.registry.adopt_entry(StateEntry(adapter, values, actual, owner)).tensors
+                elif owner is not None:
+                    # Keep the page-locked host_bytes buffer alive until the TensorsUnit is released
+                    first_view = next(iter(values.values()), None)
+                    if first_view is not None:
+                        first_view._host_owner = owner  # type: ignore[attr-defined]
             unit = TensorsUnit(adapter.unit.unit_id, values)
             loaded[key] = unit
             supplied.append(unit)

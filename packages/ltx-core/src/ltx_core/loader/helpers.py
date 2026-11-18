@@ -121,6 +121,8 @@ def to_device(model: _M, device: torch.device) -> _M:
     ``nn.Module.to`` rebuilds every parameter even when nothing moves, which costs a full walk of
     a large model per call.
     """
+    if getattr(model, "_is_split_gpu", False) or getattr(getattr(model, "velocity_model", None), "_is_split_gpu", False):
+        return model
     if device.type == "cuda" and device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
     if all(t.device == device for t in module_tensors(model)):

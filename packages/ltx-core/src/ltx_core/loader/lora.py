@@ -1,6 +1,7 @@
 """Bind checkpoint LoRA factors and patch selected model units."""
 
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 import torch
@@ -32,7 +33,7 @@ class LoRAFuser:
 
     apply_device: torch.device | None = None
     unretained_factor_placement: Placement = field(
-        default_factory=lambda: Placement(torch.device("cpu"), pin_memory=True)
+        default_factory=lambda: Placement(torch.device("cpu"), pin_memory=False)
     )
 
     def patch(
@@ -116,10 +117,11 @@ class LoRAFuser:
             a, b = values[pair.a], values[pair.b]
             apply = self.application_device(weight.device)
             aggregate = rule.dtype_for(apply)
-            a = a.to(device=apply, dtype=aggregate, non_blocking=allow_async_transfer(apply))
-            b = b.to(device=apply, dtype=aggregate, non_blocking=allow_async_transfer(apply))
-            product = (b * adapter.strength) @ a
-            delta = product if delta is None else delta + product
+            with torch.cuda.device(apply) if apply.type == "cuda" else nullcontext():
+                a = a.to(device=apply, dtype=aggregate)
+                b = b.to(device=apply, dtype=aggregate)
+                product = (b * adapter.strength) @ a
+                delta = product if delta is None else delta + product
         if delta is None or delta.device == weight.device:
             return delta
         return delta.to(weight.device, non_blocking=allow_async_transfer(weight.device))

@@ -23,8 +23,11 @@ tmp
 wandb/
 
 # Model checkpoints
+models/
 *.ckpt
 *.pt
+*.pth
+*.onnx
 *.safetensors
 *.sft
 

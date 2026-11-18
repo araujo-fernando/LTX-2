@@ -57,18 +57,25 @@ class LTXGemmaTextEncoder(torch.nn.Module, Disposable):
         if not prompts:
             return []
         tokenized = [self.tokenizer.tokenize_with_weights(t)["gemma"] for t in prompts]
+        target_device = self.model.device
         input_ids = torch.tensor(
             [[tok for tok, _ in pairs] for pairs in tokenized],
-            device=self.model.device,
+            device=target_device,
         )
         attention_mask = torch.tensor(
             [[w for _, w in pairs] for pairs in tokenized],
-            device=self.model.device,
+            device=target_device,
         )
         outputs = self.model.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
         hidden_states = outputs.hidden_states
         del outputs
-        return [(tuple(h[i : i + 1] for h in hidden_states), attention_mask[i : i + 1]) for i in range(len(prompts))]
+        return [
+            (
+                tuple(h[i : i + 1].to(target_device) for h in hidden_states),
+                attention_mask[i : i + 1].to(target_device),
+            )
+            for i in range(len(prompts))
+        ]
 
     def _model_type(self) -> str:
         return getattr(getattr(self.model, "config", None), "model_type", "") or ""

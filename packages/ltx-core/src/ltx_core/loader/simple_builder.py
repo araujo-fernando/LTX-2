@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable, Mapping, MutableMapping
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Generic, TypeVar
@@ -127,6 +127,30 @@ def _allocate_active(
     return None
 
 
+def _allocate_split_active(
+    whole_model_unit: PatchedUnitSpec,
+    key_device_map: Callable[[str], torch.device],
+    state_dict: MutableMapping[str, torch.Tensor],
+) -> None:
+    """Pre-allocate active destination storage across devices according to ``key_device_map``."""
+    metadata = whole_model_unit.clean.unit.metadata
+    strides = whole_model_unit.clean.load_mapping.tensor_mapping.destination_strides
+    aliases = whole_model_unit.clean.load_mapping.tensor_mapping.destination_aliases
+    requested_dtype = whole_model_unit.requested_dtype
+    for key, clean in metadata.items():
+        alias = aliases.get(key)
+        if alias is not None and alias in state_dict:
+            state_dict[key] = state_dict[alias]
+            continue
+        dev = key_device_map(alias if alias is not None else key)
+        dtype = active_dtype(clean, requested_dtype)
+        state_dict[key] = (
+            torch.empty_strided(clean[0], strides[key], dtype=dtype, device=dev)
+            if key in strides
+            else torch.empty(clean[0], dtype=dtype, device=dev)
+        )
+
+
 def _fused(spec: PatchedUnitSpec) -> FusedKey:
     return FusedKey.from_patched_unit_spec(spec)
 
@@ -175,11 +199,15 @@ class SimpleBuilder(Generic[_Model]):
             if active is not None and _fused(active[1]) == fused and _on(active[0].parameters(), target_device):
                 return active[0]  # type: ignore[return-value]
         state_dict = dst if dst is not None else {}
+        caller_supplied_dst = bool(state_dict)
+        key_device_map = getattr(metamodel.shell, "_key_device_map", None)
         held_spec = self.registry.held_spec(state_dict) if state_dict else None
         if held_spec is None or _fused(held_spec) != fused or not _on(state_dict.values(), target_device):
-            if state_dict:
+            if caller_supplied_dst:
                 _check_destination(state_dict, whole_model_unit.clean.unit.metadata, dtype, target_device)
                 self.registry.forget_active_models(state_dict)
+            elif key_device_map is not None:
+                _allocate_split_active(whole_model_unit, key_device_map, state_dict)
             elif dst is not None:
                 # A destination later builds rewrite in place gets storage no retained state shares.
                 _allocate_active(whole_model_unit, target_device, dst)

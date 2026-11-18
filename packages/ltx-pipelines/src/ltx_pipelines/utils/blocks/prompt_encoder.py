@@ -10,6 +10,7 @@ from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.loader.registry import ModelRegistry
 from ltx_core.loader.simple_builder import SimpleBuilder
 from ltx_core.loader.streaming_builder import StreamingBuilder, StreamingConfig
+from ltx_core.quantization.int8_convrot import has_int8_convrot_layers, swap_int8_convrot_module_op
 from ltx_core.text_encoders.gemma import (
     EMBEDDINGS_PROCESSOR_KEY_OPS,
     EmbeddingsProcessorConfigurator,
@@ -120,10 +121,16 @@ class PromptEncoder:
         else:
             self._enhancer_text_encoder_builder = self._text_encoder_builder
 
+        emb_module_ops = (
+            (swap_int8_convrot_module_op(embeddings_paths, sd_ops=(EMBEDDINGS_PROCESSOR_KEY_OPS,)),)
+            if has_int8_convrot_layers(embeddings_paths, sd_ops=(EMBEDDINGS_PROCESSOR_KEY_OPS,))
+            else ()
+        )
         self._embeddings_processor_builder = SimpleBuilder(
             EmbeddingsProcessorConfigurator.with_gemma_model_path(text_encoder_path),
             tuple(Path(path) for path in embeddings_paths),
             (EMBEDDINGS_PROCESSOR_KEY_OPS,),
+            module_ops=emb_module_ops,
             registry=unit_registry,
         )
 

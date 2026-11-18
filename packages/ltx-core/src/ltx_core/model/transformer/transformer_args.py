@@ -65,6 +65,15 @@ class AdaLNTimestepEmbedding:
     def per_token_embedding(self) -> torch.Tensor:
         return self.gather(self.embedding)
 
+    def to(self, device: torch.device) -> "AdaLNTimestepEmbedding":
+        if self.modulation.device == device:
+            return self
+        return AdaLNTimestepEmbedding(
+            modulation=self.modulation.to(device),
+            embedding=self.embedding.to(device),
+            token_indices=self.token_indices.to(device) if self.token_indices is not None else None,
+        )
+
 
 @dataclass(frozen=True)
 class TransformerArgs:
@@ -90,6 +99,54 @@ class TransformerArgs:
     self_attn_all_perturbed: bool = False
     cross_attn_perturbation_mask: torch.Tensor | None = None
     cross_attn_skip_all: bool = False
+
+    def to(self, device: torch.device) -> "TransformerArgs":
+        if self.x.device == device:
+            if (
+                (self.self_attn_perturbation_mask is None or self.self_attn_perturbation_mask.device == device)
+                and (self.cross_attn_perturbation_mask is None or self.cross_attn_perturbation_mask.device == device)
+            ):
+                return self
+            return replace(
+                self,
+                self_attn_perturbation_mask=(
+                    self.self_attn_perturbation_mask.to(device)
+                    if self.self_attn_perturbation_mask is not None
+                    else None
+                ),
+                cross_attn_perturbation_mask=(
+                    self.cross_attn_perturbation_mask.to(device)
+                    if self.cross_attn_perturbation_mask is not None
+                    else None
+                ),
+            )
+        return TransformerArgs(
+            x=self.x.to(device),
+            context=self.context.to(device),
+            context_mask=self.context_mask.to(device) if self.context_mask is not None else None,
+            timestep_embedding=self.timestep_embedding.to(device),
+            positional_embeddings=tuple(t.to(device) for t in self.positional_embeddings),
+            cross_positional_embeddings=(
+                tuple(t.to(device) for t in self.cross_positional_embeddings)
+                if self.cross_positional_embeddings is not None
+                else None
+            ),
+            cross_scale_shift_timestep=(
+                self.cross_scale_shift_timestep.to(device) if self.cross_scale_shift_timestep is not None else None
+            ),
+            cross_gate_timestep=self.cross_gate_timestep.to(device) if self.cross_gate_timestep is not None else None,
+            enabled=self.enabled,
+            prompt_timestep=self.prompt_timestep.to(device) if self.prompt_timestep is not None else None,
+            self_attention_mask=self.self_attention_mask.to(device) if self.self_attention_mask is not None else None,
+            self_attn_perturbation_mask=(
+                self.self_attn_perturbation_mask.to(device) if self.self_attn_perturbation_mask is not None else None
+            ),
+            self_attn_all_perturbed=self.self_attn_all_perturbed,
+            cross_attn_perturbation_mask=(
+                self.cross_attn_perturbation_mask.to(device) if self.cross_attn_perturbation_mask is not None else None
+            ),
+            cross_attn_skip_all=self.cross_attn_skip_all,
+        )
 
 
 class BlockPerturbationsProcessor:

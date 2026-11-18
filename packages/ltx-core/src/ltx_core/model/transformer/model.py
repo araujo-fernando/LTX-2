@@ -1,5 +1,6 @@
-import logging
+from contextlib import nullcontext
 from enum import Enum
+import logging
 
 import torch
 
@@ -437,6 +438,7 @@ class LTXModel(torch.nn.Module, Disposable):
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         """Process transformer blocks for LTX."""
         for block_idx, block in enumerate(self.transformer_blocks):
+            block_device = getattr(block, "_block_device", None)
             if video is not None:
                 video = self.block_input_processor(
                     video,
@@ -445,6 +447,8 @@ class LTXModel(torch.nn.Module, Disposable):
                     self_attn_type=PerturbationType.SKIP_VIDEO_SELF_ATTN,
                     cross_attn_type=PerturbationType.SKIP_A2V_CROSS_ATTN,
                 )
+                if block_device is not None:
+                    video = video.to(block_device)
             if audio is not None:
                 audio = self.block_input_processor(
                     audio,
@@ -453,16 +457,33 @@ class LTXModel(torch.nn.Module, Disposable):
                     self_attn_type=PerturbationType.SKIP_AUDIO_SELF_ATTN,
                     cross_attn_type=PerturbationType.SKIP_V2A_CROSS_ATTN,
                 )
+                if block_device is not None:
+                    audio = audio.to(block_device)
 
-            if self._enable_gradient_checkpointing and self.training:
-                video, audio = torch.utils.checkpoint.checkpoint(
-                    block,
-                    video,
-                    audio,
-                    use_reentrant=False,
-                )
-            else:
-                video, audio = block(video=video, audio=audio)
+            dev_ctx = (
+                torch.cuda.device(block_device)
+                if block_device is not None and block_device.type == "cuda"
+                else nullcontext()
+            )
+            with dev_ctx:
+                if self._enable_gradient_checkpointing and self.training:
+                    video, audio = torch.utils.checkpoint.checkpoint(
+                        block,
+                        video,
+                        audio,
+                        use_reentrant=False,
+                    )
+                else:
+                    video, audio = block(video=video, audio=audio)
+
+        if video is not None and hasattr(self, "scale_shift_table") and video.x.device != self.scale_shift_table.device:
+            video = video.to(self.scale_shift_table.device)
+        if (
+            audio is not None
+            and hasattr(self, "audio_scale_shift_table")
+            and audio.x.device != self.audio_scale_shift_table.device
+        ):
+            audio = audio.to(self.audio_scale_shift_table.device)
 
         return video, audio
 

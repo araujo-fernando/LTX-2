@@ -12,6 +12,7 @@ from typing_extensions import assert_never
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.quantization.fp8_cast import build_policy as _build_fp8_cast_policy
 from ltx_core.quantization.fp8_scaled_mm import build_policy as _build_fp8_scaled_mm_policy
+from ltx_core.quantization.int8_convrot import build_policy as _build_int8_convrot_policy
 from ltx_core.quantization.nvfp4 import (
     ActScale,
     build_nvfp4_cast_policy,
@@ -22,6 +23,7 @@ from ltx_core.quantization.nvfp4 import (
 class QuantizationKind(str, Enum):
     FP8_CAST = "fp8-cast"
     FP8_SCALED_MM = "fp8-scaled-mm"
+    INT8_CONVROT = "int8-convrot"
     NVFP4_CAST = "nvfp4-cast"
     NVFP4_PREQUANT = "nvfp4-prequant"
 
@@ -40,6 +42,10 @@ class QuantizationKind(str, Enum):
                 if checkpoint_path is None:
                     raise ValueError(f"{self.value} quantization requires checkpoint_path.")
                 return _build_fp8_scaled_mm_policy(checkpoint_path)
+            case QuantizationKind.INT8_CONVROT:
+                if checkpoint_path is None:
+                    raise ValueError(f"{self.value} quantization requires checkpoint_path.")
+                return _build_int8_convrot_policy(checkpoint_path)
             case QuantizationKind.NVFP4_CAST:
                 return build_nvfp4_cast_policy(act_scale=ActScale.FIXED_1)
             case QuantizationKind.NVFP4_PREQUANT:

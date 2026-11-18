@@ -97,14 +97,20 @@ def validate_shell_projection(entry: ShellEntry, projection: LoadMapping) -> Non
 def materialize_nonpersistent_buffers(model: torch.nn.Module, device: torch.device) -> None:
     """Move generated nonpersistent buffers and reject ones left on meta."""
     for module in model.modules():
+        if not module._non_persistent_buffers_set:
+            continue
+        mod_device = getattr(module, "_block_device", None)
+        if mod_device is None:
+            param = next((p for p in module.parameters(recurse=True) if p.device.type != "meta"), None)
+            mod_device = param.device if param is not None else device
         for name in module._non_persistent_buffers_set:
             value = module._buffers.get(name)
             if value is None:
                 continue
             if value.device.type == "meta":
                 raise ValueError(f"nonpersistent buffer {name!r} remains on meta")
-            if value.device != device:
-                module._buffers[name] = value.to(device)
+            if value.device != mod_device:
+                module._buffers[name] = value.to(mod_device)
 
 
 def validate_bound_model(model: torch.nn.Module, *, allowed_unbound: Collection[str] = ()) -> None:

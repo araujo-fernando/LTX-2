@@ -158,8 +158,12 @@ class CheckpointReader(UnitSource):
         """Fill each target with the raw checkpoint tensor of its key, casting where the target's dtype differs.
         Reads go straight from file bytes into the targets, through the device's stager for device targets.
         """
-        device = next((target.device for target in targets.values() if target.device.type != "cpu"), None)
-        read_raw(targets, tensors, self._raw_files(), self._stager(device))
+        by_device: dict[torch.device, dict[str, torch.Tensor]] = {}
+        for key, target in targets.items():
+            by_device.setdefault(target.device, {})[key] = target
+        for device, dev_targets in by_device.items():
+            stager_dev = device if device.type != "cpu" else None
+            read_raw(dev_targets, tensors, self._raw_files(), self._stager(stager_dev))
 
     def _header(self, path: Path) -> tuple[dict[str, dict], int]:
         if path not in self._path_set:

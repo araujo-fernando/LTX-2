@@ -213,14 +213,14 @@ def main() -> None:
         if not _has_flag(user_args, "--distilled-lora"):
             injected.extend(["--distilled-lora", str(_HQ_DISTILLED_LORA), "0.8"])
 
-    # Auto-enable sliding-window chunking for long clips (>97 frames, e.g. 10s=241 or 30s=721)
-    # so VRAM usage stays constant on the two 16GB RDNA4 GPUs.
+    # Auto-enable sliding-window chunking for long clips (>121 frames, e.g. 10s=241 or 30s=721)
+    # so VRAM usage stays constant on the two 16GB RDNA4 GPUs while 5s clips (121 frames) run in a single pass.
     combined_preview = [*injected, *user_args]
     num_frames_str = _get_flag_value(combined_preview, "--num-frames")
     if (
         num_frames_str is not None
         and num_frames_str.isdigit()
-        and int(num_frames_str) > 97
+        and int(num_frames_str) > 121
         and not _has_flag(user_args, "--chunked")
         and not _has_flag(user_args, "--chunk-pixel-frames")
     ):

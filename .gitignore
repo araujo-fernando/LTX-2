@@ -93,3 +93,6 @@ models/
 *.so
 gpu-queue-output/
 .gpu-queue-download-*/
+
+# Other files
+*.txt

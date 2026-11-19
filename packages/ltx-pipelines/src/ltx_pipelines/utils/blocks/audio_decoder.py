@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import logging
 from pathlib import Path
 
@@ -51,14 +53,15 @@ class AudioDecoder:
             registry=unit_registry,
         )
         self._alloc_trim_strategy = alloc_trim_strategy
+        self._resident_pair: tuple[torch.nn.Module, torch.nn.Module] | None = None
 
-    def __call__(self, latent: torch.Tensor) -> Audio:
-        """Decode audio *latent* through VAE decoder + vocoder, then free both."""
-        logger.info("Building audio decoder + vocoder from %s", self._checkpoint_path)
-        # The vocoder always runs in fp32 (bf16 accumulation degrades spectral
-        # metrics). On CUDA/CPU it is stored in bf16 and autocast upcasts per-op to
-        # save memory; MPS has no fp32 autocast, so store it in fp32 directly and
-        # avoid the per-call cast. Negligible footprint for this small model.
+    @contextmanager
+    def resident(self) -> Iterator["AudioDecoder"]:
+        """Keep audio decoder + vocoder resident across multiple calls."""
+        if self._resident_pair is not None:
+            yield self
+            return
+        logger.info("Building resident audio decoder + vocoder from %s", self._checkpoint_path)
         vocoder_dtype = torch.float32 if self._device.type == "mps" else self._dtype
         with (
             gpu_model(
@@ -70,4 +73,17 @@ class AudioDecoder:
                 alloc_trim_strategy=self._alloc_trim_strategy,
             ) as vocoder,
         ):
+            self._resident_pair = (decoder, vocoder)
+            try:
+                yield self
+            finally:
+                self._resident_pair = None
+
+    def __call__(self, latent: torch.Tensor) -> Audio:
+        """Decode audio *latent* through VAE decoder + vocoder, then free both."""
+        if self._resident_pair is not None:
+            decoder, vocoder = self._resident_pair
+            return vae_decode_audio(latent, decoder, vocoder)
+        with self.resident():
+            decoder, vocoder = self._resident_pair  # type: ignore[misc]
             return vae_decode_audio(latent, decoder, vocoder)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import logging
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -85,6 +86,25 @@ class VideoDecoder:
                 module_ops=module_ops,
             )
         self._alloc_trim_strategy = alloc_trim_strategy
+        self._resident_decoder: torch.nn.Module | None = None
+
+    @contextmanager
+    def resident(self, *, dtype: torch.dtype | None = None) -> Iterator["VideoDecoder"]:
+        """Keep the video decoder resident in VRAM across multiple __call__ invocations."""
+        if self._resident_decoder is not None:
+            yield self
+            return
+        build_dtype = self._dtype if dtype is None else dtype
+        logger.info("Building resident video decoder from %s", self._checkpoint_path)
+        with gpu_model(
+            self._prepared_builder().build(device=self._device, dtype=build_dtype).eval(),
+            alloc_trim_strategy=self._alloc_trim_strategy,
+        ) as decoder:
+            self._resident_decoder = decoder
+            try:
+                yield self
+            finally:
+                self._resident_decoder = None
 
     @property
     def checkpoint_path(self) -> str:
@@ -140,11 +160,13 @@ class VideoDecoder:
         """
         build_dtype = self._dtype if dtype is None else dtype
         latent = latent.to(dtype=build_dtype)
-        logger.info("Building video decoder from %s", self._checkpoint_path)
-        decoder = self._prepared_builder().build(device=self._device, dtype=build_dtype).eval()
         extra = {} if keyframes is None else {"keyframes": keyframes}
         if device_fn is not None:
             extra["device_fn"] = device_fn
+        if self._resident_decoder is not None:
+            return self._resident_decoder.decode_video(latent, tiling_config, generator, **extra)
+        logger.info("Building video decoder from %s", self._checkpoint_path)
+        decoder = self._prepared_builder().build(device=self._device, dtype=build_dtype).eval()
         chunks = decoder.decode_video(latent, tiling_config, generator, **extra)
         return _cleanup_iter(
             chunks,

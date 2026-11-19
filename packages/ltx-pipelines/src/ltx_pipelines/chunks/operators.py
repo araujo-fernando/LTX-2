@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
+from contextlib import nullcontext
 from dataclasses import replace
 
 import torch
@@ -63,104 +64,115 @@ def denoise_chunks(  # noqa: PLR0913
     carry_audio: torch.Tensor | None = None
     # Each denoise pass owns a separate carry at that stage's spatial resolution.
     stage_carry_keyframes: GeneratedKeyframes | None = None
-    for chunk in chunks:
-        incoming_keyframes = stage_carry_keyframes if stage_carry_keyframes is not None else chunk.incoming_keyframes
-        video_cond = _append_incoming_keyframes(list(chunk.make_video_conditionings(chunk)), incoming_keyframes)
-        audio_cond = list(chunk.make_audio_conditionings(chunk))
-        if any(isinstance(item, VideoGeneratedKeyframeSlots) for item in video_cond):
-            assert_stage_supports_generated_keyframes(stage)
+    ready_chunks = list(chunks)
+    if not ready_chunks:
+        return
+    # Pre-materialize conditionings so ImageConditioner (VideoEncoder) runs and frees before stage.resident()
+    precomputed_conds: list[tuple[list[ConditioningItem], list[ConditioningItem]]] = [
+        (list(c.make_video_conditionings(c)), list(c.make_audio_conditionings(c))) for c in ready_chunks
+    ]
+    with stage.resident():
+        for chunk, (base_v_cond, audio_cond) in zip(ready_chunks, precomputed_conds, strict=True):
+            incoming_keyframes = stage_carry_keyframes if stage_carry_keyframes is not None else chunk.incoming_keyframes
+            video_cond = _append_incoming_keyframes(base_v_cond, incoming_keyframes)
+            if any(isinstance(item, VideoGeneratedKeyframeSlots) for item in video_cond):
+                assert_stage_supports_generated_keyframes(stage)
 
-        # A frozen modality is pinned to ``noise_scale=0.0``, matching every other freeze site in
-        # the package. ``_build_state`` noises before it zeroes the denoise mask, so a frozen spec
-        # carrying the schedule's scale would hand the transformer a latent that is mostly Gaussian
-        # noise while ``sigma=0`` labels it clean conditioning.
-        video = (
-            ModalitySpec(
-                latent=chunk.video,
-                conditioning_fps=fps,
-                context=chunk.video_context,
-                conditionings=_append_carry(video_cond, carry_video, VideoConditionByLatentIndex),
-                noise_scale=0.0 if freeze_video else scale,
-                frozen=freeze_video,
+            # A frozen modality is pinned to ``noise_scale=0.0``, matching every other freeze site in
+            # the package. ``_build_state`` noises before it zeroes the denoise mask, so a frozen spec
+            # carrying the schedule's scale would hand the transformer a latent that is mostly Gaussian
+            # noise while ``sigma=0`` labels it clean conditioning.
+            video = (
+                ModalitySpec(
+                    latent=chunk.video,
+                    conditioning_fps=fps,
+                    context=chunk.video_context,
+                    conditionings=_append_carry(video_cond, carry_video, VideoConditionByLatentIndex),
+                    noise_scale=0.0 if freeze_video else scale,
+                    frozen=freeze_video,
+                )
+                if chunk.video is not None
+                else None
             )
-            if chunk.video is not None
-            else None
-        )
-        audio = (
-            ModalitySpec(
-                latent=chunk.audio,
-                conditioning_fps=fps,
-                context=chunk.audio_context,
-                conditionings=_append_carry(audio_cond, carry_audio, AudioConditionByLatentIndex),
-                noise_scale=0.0 if freeze_audio else audio_scale,
-                frozen=freeze_audio,
+            audio = (
+                ModalitySpec(
+                    latent=chunk.audio,
+                    conditioning_fps=fps,
+                    context=chunk.audio_context,
+                    conditionings=_append_carry(audio_cond, carry_audio, AudioConditionByLatentIndex),
+                    noise_scale=0.0 if freeze_audio else audio_scale,
+                    frozen=freeze_audio,
+                )
+                if chunk.audio is not None
+                else None
             )
-            if chunk.audio is not None
-            else None
-        )
 
-        video_state, audio_state = stage(
-            denoiser=denoiser,
-            sigmas=sigmas,
-            noiser=noiser,
-            modalities=VideoAudio(video=video, audio=audio),
-            loop=loop,
-            max_batch_size=max_batch_size,
-        )
-        video_latent = video_state.latent if video_state is not None else None
-        audio_latent = audio_state.latent if audio_state is not None else None
-        # A frozen modality is conditioning, not output: keep the latent that went in rather
-        # than the loop's copy of it. ``euler_denoising_loop`` steps frozen states too, and
-        # ``to_velocity`` rounds to the latent dtype on every step, so what comes back has
-        # drifted a few bf16 ulps from what was frozen -- inaudible in a latent, but the
-        # vocoder turns it into a visibly different waveform.
-        if freeze_video:
-            video_latent = chunk.video
-        if freeze_audio:
-            audio_latent = chunk.audio
-        sidecar = None
-        if video_state is not None and video_state.generated_keyframes is not None:
-            layout = video_state.generated_keyframe_layout
-            positions = layout.pixel_frame_indices if layout is not None else ()
-            sidecar = GeneratedKeyframes(latent=video_state.generated_keyframes, pixel_frame_indices=positions)
-        carry_video_frames = 0
-        carry_audio_frames = 0
-        if chunk.layout.next_video_carry_frames != 0:
-            t = VIDEO_SCALE_FACTORS.time
-            carry_video_frames = (chunk.layout.next_video_carry_frames - 1) // t + 1
-            carry_audio_frames = max(
-                1,
-                AudioLatentShape.from_duration(
-                    batch=1,
-                    duration=float(chunk.layout.next_video_carry_frames) / fps,
-                ).frames,
+            video_state, audio_state = stage(
+                denoiser=denoiser,
+                sigmas=sigmas,
+                noiser=noiser,
+                modalities=VideoAudio(video=video, audio=audio),
+                loop=loop,
+                max_batch_size=max_batch_size,
             )
-        carry_video = _slice_latent_tail(video_latent, carry_video_frames)
-        carry_audio = _slice_latent_tail(audio_latent, carry_audio_frames)
-        stage_carry_keyframes = _keyframes_for_next_chunk(sidecar, chunk.layout)
-        yield replace(
-            chunk,
-            video=video_latent,
-            audio=audio_latent,
-            generated_keyframes=sidecar,
-            incoming_keyframes=incoming_keyframes,
-        )
+            video_latent = video_state.latent if video_state is not None else None
+            audio_latent = audio_state.latent if audio_state is not None else None
+            # A frozen modality is conditioning, not output: keep the latent that went in rather
+            # than the loop's copy of it. ``euler_denoising_loop`` steps frozen states too, and
+            # ``to_velocity`` rounds to the latent dtype on every step, so what comes back has
+            # drifted a few bf16 ulps from what was frozen -- inaudible in a latent, but the
+            # vocoder turns it into a visibly different waveform.
+            if freeze_video:
+                video_latent = chunk.video
+            if freeze_audio:
+                audio_latent = chunk.audio
+            sidecar = None
+            if video_state is not None and video_state.generated_keyframes is not None:
+                layout = video_state.generated_keyframe_layout
+                positions = layout.pixel_frame_indices if layout is not None else ()
+                sidecar = GeneratedKeyframes(latent=video_state.generated_keyframes, pixel_frame_indices=positions)
+            carry_video_frames = 0
+            carry_audio_frames = 0
+            if chunk.layout.next_video_carry_frames != 0:
+                t = VIDEO_SCALE_FACTORS.time
+                carry_video_frames = (chunk.layout.next_video_carry_frames - 1) // t + 1
+                carry_audio_frames = max(
+                    1,
+                    AudioLatentShape.from_duration(
+                        batch=1,
+                        duration=float(chunk.layout.next_video_carry_frames) / fps,
+                    ).frames,
+                )
+            carry_video = _slice_latent_tail(video_latent, carry_video_frames)
+            carry_audio = _slice_latent_tail(audio_latent, carry_audio_frames)
+            stage_carry_keyframes = _keyframes_for_next_chunk(sidecar, chunk.layout)
+            yield replace(
+                chunk,
+                video=video_latent,
+                audio=audio_latent,
+                generated_keyframes=sidecar,
+                incoming_keyframes=incoming_keyframes,
+            )
 
 
 def spatially_upsample_chunks(chunks: Iterator[Chunk], upsampler: VideoUpsampler) -> Iterator[Chunk]:
     """Spatially upsample each chunk's video latent and generated-keyframe slots; audio and factories pass through."""
-    for chunk in chunks:
-        if chunk.video is None:
-            yield chunk
-            continue
-        video = upsampler(chunk.video[:1])
-        sidecar = chunk.generated_keyframes
-        if sidecar is not None:
-            sidecar = replace(sidecar, latent=upsampler(sidecar.latent[:1]))
-        incoming = chunk.incoming_keyframes
-        if incoming is not None:
-            incoming = replace(incoming, latent=upsampler(incoming.latent[:1]))
-        yield replace(chunk, video=video, generated_keyframes=sidecar, incoming_keyframes=incoming)
+    ready_chunks = list(chunks)
+    if not ready_chunks:
+        return
+    with upsampler.resident():
+        for chunk in ready_chunks:
+            if chunk.video is None:
+                yield chunk
+                continue
+            video = upsampler(chunk.video[:1])
+            sidecar = chunk.generated_keyframes
+            if sidecar is not None:
+                sidecar = replace(sidecar, latent=upsampler(sidecar.latent[:1]))
+            incoming = chunk.incoming_keyframes
+            if incoming is not None:
+                incoming = replace(incoming, latent=upsampler(incoming.latent[:1]))
+            yield replace(chunk, video=video, generated_keyframes=sidecar, incoming_keyframes=incoming)
 
 
 def replace_video_conditionings(
@@ -199,6 +211,7 @@ def decode_chunks(
     generator: torch.Generator | None = None,
     dtype: torch.dtype | None = None,
     keyframes: bool = False,
+    predecoded_video: Sequence[torch.Tensor | None] | None = None,
 ) -> Iterator[PlaybackSegment]:
     """Decode chunks and join their carried overlap.
     Each body streams immediately, while its outgoing video tail waits to blend
@@ -209,42 +222,57 @@ def decode_chunks(
     the global timeline. Empty decoder output is skipped. Without an
     ``audio_decoder``, chunks are video-only.
     """
+    ready_chunks = list(chunks)
+    if not ready_chunks:
+        return
+    # Decode all video chunks while keeping VideoDecoder resident once (unless predecoded_video is provided),
+    # then decode all audio chunks while keeping AudioDecoder resident once.
+    if predecoded_video is not None:
+        decoded_video_list = list(predecoded_video)
+    else:
+        decoded_video_list = []
+        with video_decoder.resident(dtype=dtype):
+            for chunk in ready_chunks:
+                if chunk.video is None:
+                    raise ValueError("decode_chunks requires chunk.video")
+                decoded_video_list.append(
+                    _decode_chunk_video(
+                        chunk,
+                        video_decoder,
+                        tiling_config,
+                        generator,
+                        dtype=dtype,
+                        keyframes=keyframes,
+                    )
+                )
+
     pending_tail: PlaybackSegment | None = None
-    for chunk in chunks:
-        if chunk.video is None:
-            raise ValueError("decode_chunks requires chunk.video")
-        layout = chunk.layout
-        decoded_frames = _decode_chunk_video(
-            chunk,
-            video_decoder,
-            tiling_config,
-            generator,
-            dtype=dtype,
-            keyframes=keyframes,
-        )
-        if decoded_frames is None:
-            continue
+    audio_ctx = audio_decoder.resident() if audio_decoder is not None else nullcontext()
+    with audio_ctx:
+        for chunk, decoded_frames in zip(ready_chunks, decoded_video_list, strict=True):
+            if decoded_frames is None:
+                continue
+            layout = chunk.layout
+            frames = _drop_video_overlap(decoded_frames, layout.prev_video_carry_frames)
+            audio, seam_fade_samples = _vocoded_chunk_audio(
+                chunk,
+                frames,
+                audio_decoder,
+                fps=fps,
+                pending_tail=pending_tail,
+            )
+            pending_tail, audio = _apply_pending_audio_crossfade(pending_tail, audio, seam_fade_samples)
 
-        frames = _drop_video_overlap(decoded_frames, layout.prev_video_carry_frames)
-        audio, seam_fade_samples = _vocoded_chunk_audio(
-            chunk,
-            frames,
-            audio_decoder,
-            fps=fps,
-            pending_tail=pending_tail,
-        )
-        pending_tail, audio = _apply_pending_audio_crossfade(pending_tail, audio, seam_fade_samples)
+            if pending_tail is not None:
+                yield _blend_pending_video_tail(pending_tail, decoded_frames, layout.prev_video_carry_frames)
+                pending_tail = None
 
-        if pending_tail is not None:
-            yield _blend_pending_video_tail(pending_tail, decoded_frames, layout.prev_video_carry_frames)
-            pending_tail = None
-
-        body, pending_tail = _body_and_pending_tail(
-            PlaybackSegment(video=frames, audio=audio),
-            layout=layout,
-            fps=fps,
-        )
-        yield body
+            body, pending_tail = _body_and_pending_tail(
+                PlaybackSegment(video=frames, audio=audio),
+                layout=layout,
+                fps=fps,
+            )
+            yield body
     if pending_tail is not None:
         yield pending_tail
 

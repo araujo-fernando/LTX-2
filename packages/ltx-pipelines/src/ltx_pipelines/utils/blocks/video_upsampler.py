@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import logging
 from pathlib import Path
 
@@ -46,10 +48,15 @@ class VideoUpsampler:
             registry=unit_registry,
         )
         self._alloc_trim_strategy = alloc_trim_strategy
+        self._resident_pair: tuple[torch.nn.Module, torch.nn.Module] | None = None
 
-    def __call__(self, latent: torch.Tensor) -> torch.Tensor:
-        """Upsample *latent* using video encoder + spatial upsampler, then free both."""
-        logger.info("Building video encoder + spatial upsampler from %s", self._upsampler_path)
+    @contextmanager
+    def resident(self) -> Iterator["VideoUpsampler"]:
+        """Keep video encoder + spatial upsampler resident across multiple calls."""
+        if self._resident_pair is not None:
+            yield self
+            return
+        logger.info("Building resident video encoder + spatial upsampler from %s", self._upsampler_path)
         with (
             gpu_model(
                 self._encoder_builder.build(device=self._device, dtype=self._dtype).eval(),
@@ -60,4 +67,17 @@ class VideoUpsampler:
                 alloc_trim_strategy=self._alloc_trim_strategy,
             ) as upsampler,
         ):
+            self._resident_pair = (encoder, upsampler)
+            try:
+                yield self
+            finally:
+                self._resident_pair = None
+
+    def __call__(self, latent: torch.Tensor) -> torch.Tensor:
+        """Upsample *latent* using video encoder + spatial upsampler, then free both."""
+        if self._resident_pair is not None:
+            encoder, upsampler = self._resident_pair
+            return upsample_video(latent=latent, video_encoder=encoder, upsampler=upsampler)
+        with self.resident():
+            encoder, upsampler = self._resident_pair  # type: ignore[misc]
             return upsample_video(latent=latent, video_encoder=encoder, upsampler=upsampler)

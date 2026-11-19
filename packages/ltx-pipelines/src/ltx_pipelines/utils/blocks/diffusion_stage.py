@@ -166,6 +166,7 @@ class DiffusionStage:
         self.video_scale_factors = scale_factors
         self._model_wrapper: ModelWrapper | None = None
         self._active_weights = active_weights
+        self._resident_transformer: X0Model | None = None
 
     @classmethod
     def from_checkpoint(  # noqa: PLR0913
@@ -414,7 +415,26 @@ class DiffusionStage:
         with streaming_model(builder, self._device, self._dtype, self._alloc_trim_strategy) as streaming_wrapper:
             yield X0Model(streaming_wrapper).eval()
 
+    @contextmanager
+    def resident(self, **kwargs: object) -> Iterator["DiffusionStage"]:
+        """Keep the built transformer resident in VRAM across multiple __call__ invocations."""
+        if self._resident_transformer is not None:
+            yield self
+            return
+        mode = "streaming" if self._is_streaming else "standard"
+        builder = self._transformer_builder
+        checkpoint = builder.paths if isinstance(builder, SimpleBuilder) else builder.base.paths
+        logger.info("Building resident transformer (%s) from %s", mode, checkpoint)
+        with self._transformer_ctx(**kwargs) as built:
+            self._resident_transformer = built
+            try:
+                yield self
+            finally:
+                self._resident_transformer = None
+
     def _transformer_ctx(self, **kwargs: object) -> AbstractContextManager:
+        if self._resident_transformer is not None:
+            return nullcontext(self._resident_transformer)
         if self._is_streaming:
             return self._streaming_transformer_ctx()
         return self._transformer_lifetime(self._build_transformer(**kwargs))
@@ -486,7 +506,8 @@ class DiffusionStage:
         mode = "streaming" if self._is_streaming else "standard"
         builder = self._transformer_builder
         checkpoint = builder.paths if isinstance(builder, SimpleBuilder) else builder.base.paths
-        logger.info("Building transformer (%s) from %s", mode, checkpoint)
+        if self._resident_transformer is None:
+            logger.info("Building transformer (%s) from %s", mode, checkpoint)
         with self._transformer_ctx(video_tools=video_tools) as built:
             transformer = built if self._model_wrapper is None else self._model_wrapper(built, video_tools)
             logger.info(

@@ -116,7 +116,11 @@ class ImageConditioner:
     def _build_encoder(self) -> VideoEncoder:
         return self._encoder_builder.build(device=self._device, dtype=self._dtype).eval()
 
+    def resident(self) -> gpu_model[VideoEncoder]:
+        """Keep the video encoder resident across multiple conditioning calls."""
+        return gpu_model(self._build_encoder(), alloc_trim_strategy=self._alloc_trim_strategy)
+
     def __call__(self, fn: Callable[[VideoEncoder], T]) -> T:
         """Build video encoder → call *fn(encoder)* → free encoder."""
-        with gpu_model(self._build_encoder(), alloc_trim_strategy=self._alloc_trim_strategy) as encoder:
+        with self.resident() as encoder:
             return fn(encoder)

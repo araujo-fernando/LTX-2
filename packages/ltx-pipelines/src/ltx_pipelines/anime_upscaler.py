@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import logging
 from pathlib import Path
 import shutil
@@ -108,6 +109,122 @@ def load_anime_upscaler(model_path: str | Path, device: torch.device, dtype: tor
 
 
 @torch.inference_mode()
+def _upscale_single_video_with_model(
+    in_path: Path,
+    out_path: Path,
+    upscaler: nn.Module,
+    target_dev: torch.device,
+    dtype: torch.dtype,
+    *,
+    target_width: int | None = None,
+    target_height: int | None = None,
+    batch_size: int = 4,
+) -> None:
+    in_place = in_path.resolve() == out_path.resolve()
+    work_out = Path(tempfile.mktemp(suffix=".mp4", dir=str(out_path.parent))) if in_place else out_path
+
+    with av.open(str(in_path)) as in_container:
+        v_in = in_container.streams.video[0]
+        fps = float(v_in.average_rate or v_in.base_rate or 24.0)
+        frames_rgb: list[np.ndarray] = [frame.to_ndarray(format="rgb24") for frame in in_container.decode(v_in)]
+
+    if not frames_rgb:
+        raise RuntimeError(f"No video frames decoded from {in_path}")
+
+    audio = decode_audio_from_file(str(in_path), device=torch.device("cpu"))
+    if audio is not None and audio.waveform.ndim == 3:
+        audio = Audio(waveform=audio.waveform.squeeze(0), sampling_rate=audio.sampling_rate)
+
+    first_tensor = (
+        torch.from_numpy(frames_rgb[0]).to(device=target_dev, dtype=dtype).permute(2, 0, 1).unsqueeze(0) / 255.0
+    )
+    first_up = upscaler(first_tensor)
+    _, _, up_h, up_w = first_up.shape
+    final_w = target_width or up_w
+    final_h = target_height or up_h
+    del first_tensor, first_up
+
+    logger.info(
+        "Upscaling %s (%d frames, %dx%d -> %dx%d) on %s",
+        in_path.name,
+        len(frames_rgb),
+        frames_rgb[0].shape[1],
+        frames_rgb[0].shape[0],
+        final_w,
+        final_h,
+        target_dev,
+    )
+
+    upscaled_batches: list[torch.Tensor] = []
+    for start in tqdm(range(0, len(frames_rgb), batch_size), desc=f"Anime Upscale ({in_path.name})"):
+        batch_np = np.stack(frames_rgb[start : start + batch_size], axis=0)
+        batch_t = (
+            torch.from_numpy(batch_np)
+            .to(device=target_dev, dtype=dtype)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+            / 255.0
+        )
+        up_t = upscaler(batch_t)
+        if up_t.shape[-2] != final_h or up_t.shape[-1] != final_w:
+            up_t = F.interpolate(up_t.float(), size=(final_h, final_w), mode="bicubic", align_corners=False)
+        upscaled_batches.append(up_t.clamp(0.0, 1.0).permute(0, 2, 3, 1).to(dtype=torch.float32, device="cpu"))
+        del batch_t, up_t
+
+    full_video = torch.cat(upscaled_batches, dim=0)
+    del upscaled_batches
+
+    encode_video(
+        video=full_video,
+        fps=fps,
+        audio=audio,
+        output_path=work_out,
+        video_chunks_number=1,
+        crf=16,
+        preset="fast",
+    )
+
+    if in_place:
+        shutil.move(str(work_out), str(out_path))
+    logger.info("Anime upscaled video saved to %s (%dx%d)", out_path, final_w, final_h)
+
+
+@torch.inference_mode()
+def upscale_videos_anime_batch(
+    video_pairs: Sequence[tuple[str | Path, str | Path]],
+    model_path: str | Path,
+    *,
+    target_width: int | None = None,
+    target_height: int | None = None,
+    batch_size: int = 4,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> None:
+    """Upscale multiple MP4 videos keeping the anime upscaler resident on the primary GPU (RX 9070 XT) once."""
+    if not video_pairs:
+        return
+    target_dev = device or get_preferred_device()
+    cleanup_accelerator_memory()
+    logger.info("Loading resident anime upscaler %s on %s for %d video(s)", Path(model_path).name, target_dev, len(video_pairs))
+    upscaler = load_anime_upscaler(model_path, device=target_dev, dtype=dtype)
+    try:
+        for in_video, out_video in video_pairs:
+            _upscale_single_video_with_model(
+                Path(in_video),
+                Path(out_video),
+                upscaler,
+                target_dev,
+                dtype,
+                target_width=target_width,
+                target_height=target_height,
+                batch_size=batch_size,
+            )
+    finally:
+        del upscaler
+        cleanup_accelerator_memory()
+
+
+@torch.inference_mode()
 def upscale_video_anime(
     input_video_path: str | Path,
     output_video_path: str | Path,
@@ -120,81 +237,12 @@ def upscale_video_anime(
     dtype: torch.dtype = torch.bfloat16,
 ) -> None:
     """Upscale an MP4 video on the primary GPU (RX 9070 XT) and preserve its audio stream."""
-    in_path = Path(input_video_path)
-    out_path = Path(output_video_path)
-    target_dev = device or get_preferred_device()
-
-    cleanup_accelerator_memory()
-    logger.info("Loading anime upscaler %s on %s", Path(model_path).name, target_dev)
-    upscaler = load_anime_upscaler(model_path, device=target_dev, dtype=dtype)
-
-    in_place = in_path.resolve() == out_path.resolve()
-    work_out = Path(tempfile.mktemp(suffix=".mp4", dir=str(out_path.parent))) if in_place else out_path
-
-    try:
-        with av.open(str(in_path)) as in_container:
-            v_in = in_container.streams.video[0]
-            fps = float(v_in.average_rate or v_in.base_rate or 24.0)
-            frames_rgb: list[np.ndarray] = [frame.to_ndarray(format="rgb24") for frame in in_container.decode(v_in)]
-
-        if not frames_rgb:
-            raise RuntimeError(f"No video frames decoded from {in_path}")
-
-        audio = decode_audio_from_file(str(in_path), device=torch.device("cpu"))
-        if audio is not None and audio.waveform.ndim == 3:
-            audio = Audio(waveform=audio.waveform.squeeze(0), sampling_rate=audio.sampling_rate)
-
-        first_tensor = (
-            torch.from_numpy(frames_rgb[0]).to(device=target_dev, dtype=dtype).permute(2, 0, 1).unsqueeze(0) / 255.0
-        )
-        first_up = upscaler(first_tensor)
-        _, _, up_h, up_w = first_up.shape
-        final_w = target_width or up_w
-        final_h = target_height or up_h
-        del first_tensor, first_up
-
-        logger.info(
-            "Upscaling %d frames (%dx%d -> %dx%d) on %s",
-            len(frames_rgb),
-            frames_rgb[0].shape[1],
-            frames_rgb[0].shape[0],
-            final_w,
-            final_h,
-            target_dev,
-        )
-
-        upscaled_batches: list[torch.Tensor] = []
-        for start in tqdm(range(0, len(frames_rgb), batch_size), desc="Anime Upscale"):
-            batch_np = np.stack(frames_rgb[start : start + batch_size], axis=0)
-            batch_t = (
-                torch.from_numpy(batch_np)
-                .to(device=target_dev, dtype=dtype)
-                .permute(0, 3, 1, 2)
-                .contiguous()
-                / 255.0
-            )
-            up_t = upscaler(batch_t)
-            if up_t.shape[-2] != final_h or up_t.shape[-1] != final_w:
-                up_t = F.interpolate(up_t.float(), size=(final_h, final_w), mode="bicubic", align_corners=False)
-            upscaled_batches.append(up_t.clamp(0.0, 1.0).permute(0, 2, 3, 1).to(dtype=torch.float32, device="cpu"))
-            del batch_t, up_t
-
-        full_video = torch.cat(upscaled_batches, dim=0)
-        del upscaled_batches
-
-        encode_video(
-            video=full_video,
-            fps=fps,
-            audio=audio,
-            output_path=work_out,
-            video_chunks_number=1,
-            crf=16,
-            preset="fast",
-        )
-
-        if in_place:
-            shutil.move(str(work_out), str(out_path))
-        logger.info("Anime upscaled video saved to %s (%dx%d)", out_path, final_w, final_h)
-    finally:
-        del upscaler
-        cleanup_accelerator_memory()
+    upscale_videos_anime_batch(
+        [(input_video_path, output_video_path)],
+        model_path=model_path,
+        target_width=target_width,
+        target_height=target_height,
+        batch_size=batch_size,
+        device=device,
+        dtype=dtype,
+    )
